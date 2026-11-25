@@ -1,0 +1,114 @@
+# ==========================================
+# ShizukuWOL Git 忽略规则
+# 排除依赖、构建缓存、IDE 配置及大体积产物（>50MB / APK 等）
+# 需保留的发行包或大体积历史产物请通过 GitHub Releases 附件托管
+# ==========================================
+
+# --- Android / Gradle 构建产物与依赖缓存 ---
+.gradle/
+**/build/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+local.properties
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+*.ear
+*.war
+*.aar
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# --- 签名密钥与敏感配置 ---
+*.jks
+*.keystore
+*.p12
+.env
+.env.*
+!.env.example
+
+# --- 通用依赖与包管理器缓存 ---
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.pnp.*
+bower_components/
+vendor/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- 通用构建输出与临时缓存 ---
+dist/
+out/
+target/
+.cache/
+.parcel-cache/
+.turbo/
+.next/
+.nuxt/
+coverage/
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# --- 大体积产物与二进制归档（避免 >50MB 文件进入 Git 历史） ---
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.xz
+*.iso
+*.img
+*.dmg
+*.exe
+*.msi
+*.dll
+*.so
+*.dylib
+*.hprof
+*.heapdump
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.wav
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.gguf
+*.ckpt
+*.bin
+
+# --- IDE / 编辑器与操作系统生成文件 ---
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.vs/
+.classpath
+.project
+.settings/
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
