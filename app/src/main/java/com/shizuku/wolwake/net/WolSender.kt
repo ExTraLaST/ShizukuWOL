@@ -21,6 +21,9 @@ object WolSender {
     fun send(config: WolConfig, repeat: Int = 3): Result<Int> {
         val macBytes = WolConfig.parseMac(config.macAddress)
             ?: return Result.failure(IllegalArgumentException("MAC 地址格式不正确"))
+        if (config.wolPort !in 1..65535) {
+            return Result.failure(IllegalArgumentException("魔法包端口无效（需在 1-65535 之间）"))
+        }
         val packetData = buildMagicPacket(macBytes)
         return try {
             val address = InetAddress.getByName(config.broadcastAddress.trim())

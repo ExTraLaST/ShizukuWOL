@@ -54,6 +54,7 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
 
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
     private var wakeJob: Job? = null
+    private var ztStartupJob: Job? = null
 
     init {
         ZeroTierManager.initDiagnostics(app)
@@ -66,8 +67,10 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
         val cfg = store.load()
         val nwid = WolConfig.parseZtNetworkId(cfg.ztNetworkId)
         if (cfg.ztEnabled && nwid != null) {
-            viewModelScope.launch(Dispatchers.IO) {
-                _ztStatus.value = ZeroTierManager.ensureReady(app, nwid)
+            ztStartupJob = viewModelScope.launch(Dispatchers.IO) {
+                runCatching { ZeroTierManager.ensureReady(app, nwid) }
+                    .onSuccess { _ztStatus.value = it }
+                    .onFailure { ZeroTierManager.logException("初始化 ZeroTier 异常", it) }
             }
         }
     }
@@ -76,12 +79,16 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
         val cfg = config.value
         val nwid = WolConfig.parseZtNetworkId(cfg.ztNetworkId) ?: return
         if (cfg.ztEnabled) {
-            viewModelScope.launch(Dispatchers.IO) {
-                _ztStatus.value = if (!ZeroTierManager.isRunning()) {
-                    ZeroTierManager.ensureReady(app, nwid)
-                } else {
-                    ZeroTierManager.refreshStatus()
-                }
+            if (ztStartupJob?.isActive == true) return
+            ztStartupJob = viewModelScope.launch(Dispatchers.IO) {
+                runCatching {
+                    if (!ZeroTierManager.isRunning()) {
+                        ZeroTierManager.ensureReady(app, nwid)
+                    } else {
+                        ZeroTierManager.refreshStatus()
+                    }
+                }.onSuccess { _ztStatus.value = it }
+                    .onFailure { ZeroTierManager.logException("恢复前台刷新 ZeroTier 异常", it) }
             }
         }
     }
@@ -90,17 +97,19 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
         val cfg = config.value
         val nwid = WolConfig.parseZtNetworkId(cfg.ztNetworkId) ?: return
         if (cfg.ztEnabled) {
-            viewModelScope.launch(Dispatchers.IO) {
-                ZeroTierManager.logSection("重新连接 ZeroTier")
-                if (ZeroTierManager.isReadyFor(nwid)) {
-                    ZeroTierManager.logNote("重新连接：节点已在目标网络就绪，跳过 leave/join，仅刷新状态")
-                    _ztStatus.value = ZeroTierManager.refreshStatus()
-                    _ztStatus.value = ZeroTierManager.ensureReady(app, nwid)
-                } else {
-                    ZeroTierManager.stop()
-                    _ztStatus.value = ZeroTierManager.currentStatus()
-                    _ztStatus.value = ZeroTierManager.ensureReady(app, nwid)
-                }
+            ztStartupJob = viewModelScope.launch(Dispatchers.IO) {
+                runCatching {
+                    ZeroTierManager.logSection("重新连接 ZeroTier")
+                    if (ZeroTierManager.isReadyFor(nwid)) {
+                        ZeroTierManager.logNote("重新连接：节点已在目标网络就绪，跳过 leave/join，仅刷新状态")
+                        _ztStatus.value = ZeroTierManager.refreshStatus()
+                        _ztStatus.value = ZeroTierManager.ensureReady(app, nwid)
+                    } else {
+                        ZeroTierManager.stop()
+                        _ztStatus.value = ZeroTierManager.currentStatus()
+                        _ztStatus.value = ZeroTierManager.ensureReady(app, nwid)
+                    }
+                }.onFailure { ZeroTierManager.logException("重新连接 ZeroTier 异常", it) }
             }
         }
     }
@@ -126,18 +135,22 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
     private fun applyZtEnabled(config: WolConfig) {
         val nwid = WolConfig.parseZtNetworkId(config.ztNetworkId)
         if (config.ztEnabled && nwid != null) {
-            viewModelScope.launch(Dispatchers.IO) {
-                _ztStatus.value = ZeroTierManager.ensureReady(app, nwid)
+            ztStartupJob = viewModelScope.launch(Dispatchers.IO) {
+                runCatching { ZeroTierManager.ensureReady(app, nwid) }
+                    .onSuccess { _ztStatus.value = it }
+                    .onFailure { ZeroTierManager.logException("启用 ZeroTier 异常", it) }
             }
         } else if (!config.ztEnabled) {
-            viewModelScope.launch(Dispatchers.IO) {
-                ZeroTierManager.stop()
-                _ztStatus.value = ZeroTierManager.currentStatus()
+            ztStartupJob = viewModelScope.launch(Dispatchers.IO) {
+                runCatching {
+                    ZeroTierManager.stop()
+                    _ztStatus.value = ZeroTierManager.currentStatus()
+                }.onFailure { ZeroTierManager.logException("关闭 ZeroTier 异常", it) }
             }
         }
     }
 
-    private fun now(): String = timeFormat.format(Date())
+    private fun now(): String = synchronized(timeFormat) { timeFormat.format(Date()) }
 
     private fun logWakeStart(cfg: WolConfig, action: String) {
         ZeroTierManager.logSection("唤醒开始（$action）")
@@ -158,6 +171,7 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun sshWakeStep(cfg: WolConfig): ResultLine {
         val ctx = coroutineContext
+        val cancelledCheck: () -> Boolean = { !ctx.isActive }
         val nwid = WolConfig.parseZtNetworkId(cfg.ztNetworkId)
         if (!cfg.ztEnabled || nwid == null) {
             if (cfg.ztEnabled) {
@@ -165,7 +179,9 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 ZeroTierManager.logNote("SSH 分支：内置 ZeroTier 未启用，走普通 SSH")
             }
-            val r = withContext(Dispatchers.IO) { SshWake.wake(cfg) }
+            val r = withContext(Dispatchers.IO) {
+                SshWake.wake(cfg, cancelled = cancelledCheck, registerAsActiveWake = true)
+            }
             ctx.ensureActive()
             ZeroTierManager.logNote("普通 SSH 结果：success=${r.success} message=${r.message}")
             return ResultLine("路由器 SSH", r.success, r.message)
@@ -173,7 +189,7 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
 
         ZeroTierManager.logNote("SSH 分支：内置 ZeroTier 已启用且网络 ID 有效，调用 ensureReady")
         val zt = withContext(Dispatchers.IO) {
-            ZeroTierManager.ensureReady(app, nwid, cancelled = { !ctx.isActive })
+            ZeroTierManager.ensureReady(app, nwid, cancelled = cancelledCheck)
         }
         ctx.ensureActive()
         _ztStatus.value = zt
@@ -187,7 +203,9 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
             ZeroTierManager.logNote(
                 "SSH 分支：内置 ZeroTier 未就绪（${zt.lastError ?: "未知原因"}），回落普通 SSH"
             )
-            val fb = withContext(Dispatchers.IO) { SshWake.wake(cfg) }
+            val fb = withContext(Dispatchers.IO) {
+                SshWake.wake(cfg, cancelled = cancelledCheck, registerAsActiveWake = true)
+            }
             ctx.ensureActive()
             ZeroTierManager.logNote("回落普通 SSH 结果：success=${fb.success} message=${fb.message}")
             return ResultLine(
@@ -197,13 +215,17 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
 
-        ZeroTierManager.logSnapshot("内置 SSH 前", nwid)
+        withContext(Dispatchers.IO) {
+            ZeroTierManager.logSnapshot("内置 SSH 前", nwid)
+        }
         ZeroTierManager.logNote(
             "SSH 分支：节点就绪，尝试内置 ZeroTier SSH（ztSshHost=${
                 cfg.ztSshHost.trim().ifBlank { "（空，将回落 sshHost）" }
             }）"
         )
-        val r = withContext(Dispatchers.IO) { SshWake.wakeViaZeroTier(cfg) }
+        val r = withContext(Dispatchers.IO) {
+            SshWake.wakeViaZeroTier(cfg, cancelled = cancelledCheck, registerAsActiveWake = true)
+        }
         ctx.ensureActive()
         ZeroTierManager.logNote("内置 ZeroTier SSH 结果：success=${r.success} message=${r.message}")
         if (r.success) {
@@ -211,7 +233,9 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         ZeroTierManager.logNote("SSH 分支：内置 ZeroTier SSH 失败，决定回落普通 SSH")
-        val fb = withContext(Dispatchers.IO) { SshWake.wake(cfg) }
+        val fb = withContext(Dispatchers.IO) {
+            SshWake.wake(cfg, cancelled = cancelledCheck, registerAsActiveWake = true)
+        }
         ctx.ensureActive()
         ZeroTierManager.logNote("回落普通 SSH 结果：success=${fb.success} message=${fb.message}")
         return ResultLine(
@@ -233,35 +257,47 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         if (_uiState.value.isWaking) return
+        SshWake.resetWakeCancellation()
         _uiState.value = _uiState.value.copy(
             isWaking = true,
             resultLines = emptyList()
         )
         wakeJob = viewModelScope.launch {
-            val lines = mutableListOf<ResultLine>()
-            lines.add(sshWakeStep(cfg))
-            coroutineContext.ensureActive()
+            try {
+                val lines = mutableListOf<ResultLine>()
+                lines.add(sshWakeStep(cfg))
+                coroutineContext.ensureActive()
 
-            val wolResult = withContext(Dispatchers.IO) { WolSender.send(cfg) }
-            if (wolResult.isSuccess) {
-                val count = wolResult.getOrNull()
-                ZeroTierManager.logNote("魔法包发送成功：$count 次")
-                lines.add(ResultLine("魔法包", true, "已发送 $count 次"))
-            } else {
-                val err = wolResult.exceptionOrNull()
-                if (err != null) {
-                    ZeroTierManager.logException("魔法包发送失败", err)
+                val wolResult = withContext(Dispatchers.IO) { WolSender.send(cfg) }
+                if (wolResult.isSuccess) {
+                    val count = wolResult.getOrNull()
+                    ZeroTierManager.logNote("魔法包发送成功：$count 次")
+                    lines.add(ResultLine("魔法包", true, "已发送 $count 次"))
                 } else {
-                    ZeroTierManager.logNote("魔法包发送失败：未知错误")
+                    val err = wolResult.exceptionOrNull()
+                    if (err != null) {
+                        ZeroTierManager.logException("魔法包发送失败", err)
+                    } else {
+                        ZeroTierManager.logNote("魔法包发送失败：未知错误")
+                    }
+                    lines.add(ResultLine("魔法包", false, "发送失败：${err?.message ?: "未知错误"}"))
                 }
-                lines.add(ResultLine("魔法包", false, "发送失败：${err?.message ?: "未知错误"}"))
-            }
 
-            _uiState.value = _uiState.value.copy(
-                isWaking = false,
-                resultLines = lines,
-                lastActionTime = now()
-            )
+                _uiState.value = _uiState.value.copy(
+                    isWaking = false,
+                    resultLines = lines,
+                    lastActionTime = now()
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                ZeroTierManager.logException("一键唤醒异常", t)
+                _uiState.value = _uiState.value.copy(
+                    isWaking = false,
+                    resultLines = listOf(ResultLine("唤醒异常", false, t.message ?: t.javaClass.simpleName)),
+                    lastActionTime = now()
+                )
+            }
         }
     }
 
@@ -282,25 +318,36 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
             resultLines = emptyList()
         )
         wakeJob = viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) { WolSender.send(cfg) }
-            val line = if (result.isSuccess) {
-                val count = result.getOrNull()
-                ZeroTierManager.logNote("魔法包发送成功：$count 次")
-                ResultLine("魔法包", true, "已发送 $count 次")
-            } else {
-                val err = result.exceptionOrNull()
-                if (err != null) {
-                    ZeroTierManager.logException("魔法包发送失败", err)
+            try {
+                val result = withContext(Dispatchers.IO) { WolSender.send(cfg) }
+                val line = if (result.isSuccess) {
+                    val count = result.getOrNull()
+                    ZeroTierManager.logNote("魔法包发送成功：$count 次")
+                    ResultLine("魔法包", true, "已发送 $count 次")
                 } else {
-                    ZeroTierManager.logNote("魔法包发送失败：未知错误")
+                    val err = result.exceptionOrNull()
+                    if (err != null) {
+                        ZeroTierManager.logException("魔法包发送失败", err)
+                    } else {
+                        ZeroTierManager.logNote("魔法包发送失败：未知错误")
+                    }
+                    ResultLine("魔法包", false, "发送失败：${err?.message ?: "未知错误"}")
                 }
-                ResultLine("魔法包", false, "发送失败：${err?.message ?: "未知错误"}")
+                _uiState.value = _uiState.value.copy(
+                    isWaking = false,
+                    resultLines = listOf(line),
+                    lastActionTime = now()
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                ZeroTierManager.logException("只发魔法包异常", t)
+                _uiState.value = _uiState.value.copy(
+                    isWaking = false,
+                    resultLines = listOf(ResultLine("魔法包", false, t.message ?: t.javaClass.simpleName)),
+                    lastActionTime = now()
+                )
             }
-            _uiState.value = _uiState.value.copy(
-                isWaking = false,
-                resultLines = listOf(line),
-                lastActionTime = now()
-            )
         }
     }
 
@@ -316,17 +363,29 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         if (_uiState.value.isWaking) return
+        SshWake.resetWakeCancellation()
         _uiState.value = _uiState.value.copy(
             isWaking = true,
             resultLines = emptyList()
         )
         wakeJob = viewModelScope.launch {
-            val line = sshWakeStep(cfg)
-            _uiState.value = _uiState.value.copy(
-                isWaking = false,
-                resultLines = listOf(line),
-                lastActionTime = now()
-            )
+            try {
+                val line = sshWakeStep(cfg)
+                _uiState.value = _uiState.value.copy(
+                    isWaking = false,
+                    resultLines = listOf(line),
+                    lastActionTime = now()
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                ZeroTierManager.logException("SSH 唤醒异常", t)
+                _uiState.value = _uiState.value.copy(
+                    isWaking = false,
+                    resultLines = listOf(ResultLine("路由器 SSH", false, t.message ?: t.javaClass.simpleName)),
+                    lastActionTime = now()
+                )
+            }
         }
     }
 
@@ -334,7 +393,9 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
         val job = wakeJob
         if ((job != null && job.isActive) || _uiState.value.isWaking) {
             job?.cancel()
-            SshWake.cancelActive()
+            viewModelScope.launch(Dispatchers.IO) {
+                SshWake.cancelActive()
+            }
             ZeroTierManager.logNote("唤醒已停止（用户点按停止）")
             _uiState.value = _uiState.value.copy(
                 isWaking = false,
@@ -345,13 +406,17 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun routerCheckStep(cfg: WolConfig): PingCheck.Status? {
+        val ctx = coroutineContext
+        val cancelledCheck: () -> Boolean = { !ctx.isActive }
         val nwid = WolConfig.parseZtNetworkId(cfg.ztNetworkId)
         if (cfg.ztEnabled && nwid != null) {
-            val zt = withContext(Dispatchers.IO) { ZeroTierManager.ensureReady(app, nwid) }
+            val zt = withContext(Dispatchers.IO) {
+                ZeroTierManager.ensureReady(app, nwid, cancelled = cancelledCheck)
+            }
             _ztStatus.value = zt
             if (zt.networkReady) {
                 val r = withContext(Dispatchers.IO) {
-                    SshWake.checkPcViaRouter(cfg, useZeroTier = true)
+                    SshWake.checkPcViaRouter(cfg, useZeroTier = true, cancelled = cancelledCheck)
                 }
                 if (r != null) return r
                 ZeroTierManager.logNote("[状态检测] 内置 ZeroTier 路由器检测不可用，试普通 SSH")
@@ -361,7 +426,7 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (cfg.sshHost.trim().isEmpty()) return null
         return withContext(Dispatchers.IO) {
-            SshWake.checkPcViaRouter(cfg, useZeroTier = false)
+            SshWake.checkPcViaRouter(cfg, useZeroTier = false, cancelled = cancelledCheck)
         }
     }
 
@@ -405,6 +470,13 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
                 )
             } catch (e: CancellationException) {
                 throw e
+            } catch (t: Throwable) {
+                ZeroTierManager.logException("状态检测异常", t)
+                _uiState.value = _uiState.value.copy(
+                    isChecking = false,
+                    pcStatus = PingCheck.Status.UNKNOWN,
+                    lastActionTime = now()
+                )
             }
         }
     }

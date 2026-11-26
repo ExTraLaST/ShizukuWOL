@@ -20,6 +20,7 @@ object ZeroTierManager {
     private const val MAX_LOG_FILE_LINES = 1000
     private const val MAX_LOG_TEXT_CHARS = 2500
     private const val MAX_SEEN_PEERS = 64
+    private const val MAX_VALID_NODE_ID = 0xFFFFFFFFFFL // ZeroTier 节点 ID 为 40 位无符号整数
 
     private val lock = Any()
     private val logLock = Any()
@@ -27,6 +28,9 @@ object ZeroTierManager {
 
     @Volatile
     private var node: ZeroTierNode? = null
+
+    @Volatile
+    private var nodeReady: Boolean = false
 
     @Volatile
     private var startedNetworkId: Long = 0L
@@ -52,6 +56,10 @@ object ZeroTierManager {
     private val _diagLogFlow = MutableStateFlow<List<ZtLogEntry>>(emptyList())
     val diagLogFlow: StateFlow<List<ZtLogEntry>> = _diagLogFlow.asStateFlow()
 
+    fun isValidNodeId(id: Long): Boolean = id in 1L..MAX_VALID_NODE_ID
+
+    private fun normalizeNodeId(id: Long): Long = if (isValidNodeId(id)) id else 0L
+
     data class ZtStatus(
         val nodeId: Long = 0L,
         val online: Boolean = false,
@@ -59,7 +67,7 @@ object ZeroTierManager {
         val assignedIp: String? = null,
         val lastError: String? = null
     ) {
-        fun nodeIdHex(): String = if (nodeId == 0L) "" else java.lang.Long.toHexString(nodeId)
+        fun nodeIdHex(): String = if (isValidNodeId(nodeId)) java.lang.Long.toHexString(nodeId) else ""
     }
 
     data class ZtLogEntry(
@@ -300,12 +308,15 @@ object ZeroTierManager {
         }
     }
 
-    fun isRunning(): Boolean = node != null
+    fun isRunning(): Boolean = node != null && nodeReady
 
     fun refreshStatus(): ZtStatus {
         val n = node ?: return currentStatus()
+        if (!nodeReady) return currentStatus()
         val netId = startedNetworkId
         return try {
+            val id = normalizeNodeId(runCatching { n.id }.getOrDefault(0L))
+            if (id == 0L) return currentStatus()
             val online = runCatching { n.isOnline }.getOrDefault(false)
             val ready = if (netId != 0L) {
                 runCatching { n.isNetworkTransportReady(netId) }.getOrDefault(false)
@@ -313,7 +324,6 @@ object ZeroTierManager {
                 false
             }
             val ip = if (netId != 0L) readAssignedIp(n, netId) else null
-            val id = runCatching { n.id }.getOrDefault(0L)
             val s = ZtStatus(id, online, ready, ip, currentStatus().lastError)
             setStatus(s)
             s
@@ -366,22 +376,33 @@ object ZeroTierManager {
     }
 
     fun logSnapshot(label: String, networkId: Long) {
+        if (!diagLogEnabled) return
         val n = node
-        if (n == null) {
-            logNote("快照[$label] 跳过：节点对象未创建")
+        if (n == null || !nodeReady) {
+            logNote("快照[$label] 跳过：节点对象未就绪")
             return
         }
-        val nodeId = runCatching { n.id }.getOrDefault(0L)
+        val nodeId = normalizeNodeId(runCatching { n.id }.getOrDefault(0L))
         if (nodeId == 0L) {
-            logNote("快照[$label] 跳过：getId()=0，native 节点未创建")
+            logNote("快照[$label] 跳过：getId() 无效，native 节点未创建")
             return
         }
         val online = runCatching { n.isOnline }.getOrDefault(false)
         val transportReady = runCatching { n.isNetworkTransportReady(networkId) }.getOrDefault(false)
         val assignedIp = readAssignedIp(n, networkId) ?: "未分配"
         val port = nativeIntText { ZeroTierNative.zts_node_get_port() }
-        val addrCount = nativeIntText { ZeroTierNative.zts_core_query_addr_count(networkId) }
-        val routeCount = nativeIntText { ZeroTierNative.zts_core_query_route_count(networkId) }
+        // libzt 的 zts_core_query_* 内部不加 _nets_m 锁，必须成对使用 zts_core_lock_obtain/release
+        var addrCount = "未获取锁"
+        var routeCount = "未获取锁"
+        val lockRes = runCatching { ZeroTierNative.zts_core_lock_obtain() }.getOrDefault(-1)
+        if (lockRes == ZeroTierNative.ZTS_ERR_OK) {
+            try {
+                addrCount = nativeIntText { ZeroTierNative.zts_core_query_addr_count(networkId) }
+                routeCount = nativeIntText { ZeroTierNative.zts_core_query_route_count(networkId) }
+            } finally {
+                runCatching { ZeroTierNative.zts_core_lock_release() }
+            }
+        }
         val routeAssigned = runCatching {
             ZeroTierNative.zts_route_is_assigned(networkId, ZeroTierNative.ZTS_AF_INET)
         }.getOrNull()
@@ -456,19 +477,23 @@ object ZeroTierManager {
                 logNote("ensureReady：复用已有 ZeroTierNode，跳过 init/start")
             }
 
-            // 等待门：join()/leave() 前必须确认 getId() != 0，避免 start 后直接 join 空指针崩溃
+            // 等待门：join()/leave() 前必须确认 getId() 返回合法正值，避免 start 后返回负数错误码绕过门闩导致空指针崩溃
             val gateStart = System.currentTimeMillis()
             val nodeDeadline = gateStart + 5000L
             var nodeId = 0L
-            while (nodeId == 0L && System.currentTimeMillis() < nodeDeadline) {
+            while (!isValidNodeId(nodeId) && System.currentTimeMillis() < nodeDeadline) {
+                if (cancelled()) {
+                    logNote("ensureReady 被取消（getId 门闩等待期间），停止等待")
+                    return@synchronized status.copy()
+                }
                 nodeId = runCatching { n.id }.getOrDefault(0L)
-                if (nodeId == 0L) {
+                if (!isValidNodeId(nodeId)) {
                     Thread.sleep(100L)
                 }
             }
             val gateElapsed = System.currentTimeMillis() - gateStart
-            logNote("getId 门闩：等待 ${gateElapsed}ms nodeId=${hex(nodeId)}")
-            if (nodeId == 0L) {
+            logNote("getId 门闩：等待 ${gateElapsed}ms nodeId=${hex(normalizeNodeId(nodeId))}")
+            if (!isValidNodeId(nodeId)) {
                 val errMsg = "start() 后 5 秒内节点一直没创建出来，未调 join()，请重试"
                 logNote(errMsg)
                 logNote("ensureReady 结束：elapsed=${System.currentTimeMillis() - startTime}ms status=门闩超时")
@@ -476,6 +501,7 @@ object ZeroTierManager {
                 setStatus(s)
                 return@synchronized s
             }
+            nodeReady = true
             if (justStarted) {
                 logNote("节点已创建，Node ID：${java.lang.Long.toHexString(nodeId)}")
             }
@@ -485,13 +511,13 @@ object ZeroTierManager {
                 logNote("ensureReady：网络切换 ${hex(oldNetworkId)} -> ${hex(networkId)}")
                 if (oldNetworkId != 0L) {
                     val gateId = runCatching { n.id }.getOrDefault(0L)
-                    if (gateId != 0L) {
+                    if (isValidNodeId(gateId)) {
                         val leaveRes = runCatching { n.leave(oldNetworkId) }
                             .onFailure { logException("leave 旧网络异常", it) }
                             .getOrDefault(-1)
                         logNote("leave(${hex(oldNetworkId)}) 返回 $leaveRes")
                     } else {
-                        logNote("leave 旧网络跳过：getId()=0，门闩未通过")
+                        logNote("leave 旧网络跳过：getId() 无效，门闩未通过")
                     }
                 }
                 if (cancelled()) {
@@ -514,7 +540,7 @@ object ZeroTierManager {
             var online = false
             var ready = false
             var ip: String? = null
-            var id = 0L
+            var id = nodeId
 
             var hasLoggedInitial = false
             var lastOnline = false
@@ -529,7 +555,10 @@ object ZeroTierManager {
                 online = runCatching { n.isOnline }.getOrDefault(false)
                 ready = runCatching { n.isNetworkTransportReady(networkId) }.getOrDefault(false)
                 ip = readAssignedIp(n, networkId)
-                id = runCatching { n.id }.getOrDefault(0L)
+                val polledId = normalizeNodeId(runCatching { n.id }.getOrDefault(0L))
+                if (polledId != 0L) {
+                    id = polledId
+                }
                 setStatus(ZtStatus(id, online, ready, ip, null))
 
                 if (!hasLoggedInitial || online != lastOnline || ready != lastReady || ip != lastIp) {
@@ -582,18 +611,18 @@ object ZeroTierManager {
         logNote("stop 开始：startedNetworkId=${hex(oldNetworkId)} node存在=${node != null}")
         try {
             val n = node
-            if (n != null && oldNetworkId != 0L) {
+            if (n != null && nodeReady && oldNetworkId != 0L) {
                 val gateId = runCatching { n.id }.getOrDefault(0L)
-                if (gateId != 0L) {
+                if (isValidNodeId(gateId)) {
                     val leaveRes = runCatching { n.leave(oldNetworkId) }
                         .onFailure { logException("stop leave 异常", it) }
                         .getOrDefault(-1)
                     logNote("stop leave(${hex(oldNetworkId)}) 返回 $leaveRes")
                 } else {
-                    logNote("stop leave 跳过：getId()=0，门闩未通过")
+                    logNote("stop leave 跳过：getId() 无效，门闩未通过")
                 }
             } else {
-                logNote("stop leave 跳过：node存在=${n != null} startedNetworkId=${hex(oldNetworkId)}")
+                logNote("stop leave 跳过：node存在=${n != null} nodeReady=$nodeReady startedNetworkId=${hex(oldNetworkId)}")
             }
         } finally {
             startedNetworkId = 0L
@@ -604,6 +633,7 @@ object ZeroTierManager {
 
     fun isReadyQuick(networkId: Long): Boolean {
         val n = node ?: return false
+        if (!nodeReady) return false
         return try {
             startedNetworkId == networkId && n.isOnline && n.isNetworkTransportReady(networkId)
         } catch (_: Throwable) {
