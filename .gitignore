@@ -20,6 +20,7 @@ local.properties
 *.ear
 *.war
 *.aar
+!app/libs/libzt-release.aar
 *.jar
 !gradle/wrapper/gradle-wrapper.jar
 

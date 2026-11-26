@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">一键唤醒</string>
+    <string name="widget_description">点一下就唤醒家里的电脑（用 App 里保存的配置）</string>
+</resources>
