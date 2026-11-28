@@ -1,0 +1,148 @@
+name: Build and Release Signed APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag（留空则自动读取 app/build.gradle.kts 的 versionName，如 v1.1.8）'
+        required: false
+        default: ''
+      notes:
+        description: '自定义发布说明（留空则自动生成）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Resolve version and tag
+        id: meta
+        run: |
+          VERSION_NAME=$(grep -E 'versionName\s*=' app/build.gradle.kts | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
+          VERSION_CODE=$(grep -E 'versionCode\s*=' app/build.gradle.kts | head -n 1 | sed -E 's/.*=\s*([0-9]+).*/\1/')
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v${VERSION_NAME}"
+          fi
+          APK_NAME="ShizukuWOL-${TAG}.apk"
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "apk_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=${TAG}, versionName=${VERSION_NAME}, versionCode=${VERSION_CODE}"
+
+      - name: Decode release keystore
+        env:
+          WOL_KEYSTORE_BASE64: ${{ secrets.WOL_KEYSTORE_BASE64 }}
+          WOL_STORE_PASSWORD: ${{ secrets.WOL_STORE_PASSWORD }}
+          WOL_KEY_PASSWORD: ${{ secrets.WOL_KEY_PASSWORD }}
+        run: |
+          if [ -z "$WOL_KEYSTORE_BASE64" ] || [ -z "$WOL_STORE_PASSWORD" ] || [ -z "$WOL_KEY_PASSWORD" ]; then
+            echo "::error::缺少必需的 Actions Secrets（WOL_KEYSTORE_BASE64 / WOL_STORE_PASSWORD / WOL_KEY_PASSWORD）"
+            exit 1
+          fi
+          printf '%s' "$WOL_KEYSTORE_BASE64" | tr -d '\r\n' | base64 -d > "${RUNNER_TEMP}/wol-release.jks"
+          chmod 600 "${RUNNER_TEMP}/wol-release.jks"
+
+      - name: Build signed Release APK
+        env:
+          WOL_KEYSTORE_PATH: ${{ runner.temp }}/wol-release.jks
+          WOL_KEY_ALIAS: ${{ secrets.WOL_KEY_ALIAS || 'wolwake' }}
+          WOL_STORE_PASSWORD: ${{ secrets.WOL_STORE_PASSWORD }}
+          WOL_KEY_PASSWORD: ${{ secrets.WOL_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Verify signed APK and libzt.so
+        id: verify
+        run: |
+          SRC_APK="app/build/outputs/apk/release/app-release.apk"
+          OUT_APK="${RUNNER_TEMP}/${{ steps.meta.outputs.apk_name }}"
+          if [ ! -f "$SRC_APK" ]; then
+            echo "::error::未找到已签名产物 $SRC_APK（请检查签名 Secrets 配置）"
+            exit 1
+          fi
+
+          # 确认两个架构的 libzt.so 均已打入 APK
+          unzip -l "$SRC_APK" | grep -q 'lib/arm64-v8a/libzt.so'
+          unzip -l "$SRC_APK" | grep -q 'lib/armeabi-v7a/libzt.so'
+
+          # 校验 APK 签名并提取证书 SHA-256
+          APKSIGNER=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -name apksigner | sort -V | tail -n 1)
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::未找到 apksigner"
+            exit 1
+          fi
+          CERT_INFO=$("$APKSIGNER" verify --print-certs "$SRC_APK")
+          echo "$CERT_INFO"
+          CERT_SHA256=$(echo "$CERT_INFO" | grep -i 'certificate SHA-256 digest:' | head -n 1 | awk '{print $NF}')
+
+          cp "$SRC_APK" "$OUT_APK"
+          APK_SHA256=$(sha256sum "$OUT_APK" | awk '{print $1}')
+          echo "cert_sha256=${CERT_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "apk_sha256=${APK_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "out_apk=${OUT_APK}" >> "$GITHUB_OUTPUT"
+
+      - name: Clean up keystore
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/wol-release.jks"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CUSTOM_NOTES: ${{ inputs.notes }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION_NAME="${{ steps.meta.outputs.version_name }}"
+          VERSION_CODE="${{ steps.meta.outputs.version_code }}"
+          APK_PATH="${{ steps.verify.outputs.out_apk }}"
+          APK_SHA256="${{ steps.verify.outputs.apk_sha256 }}"
+          CERT_SHA256="${{ steps.verify.outputs.cert_sha256 }}"
+
+          NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
+          if [ -n "$CUSTOM_NOTES" ]; then
+            printf '%s\n' "$CUSTOM_NOTES" > "$NOTES_FILE"
+          else
+            cat <<EOF > "$NOTES_FILE"
+          ## ShizukuWOL ${TAG}（versionCode ${VERSION_CODE} / ${VERSION_NAME}）
+
+          - 包名：\`com.shizuku.wolwake\`
+          - 原生库校验：已包含 \`lib/arm64-v8a/libzt.so\` 与 \`lib/armeabi-v7a/libzt.so\`
+          - 签名证书 SHA-256：\`${CERT_SHA256}\`
+          - APK SHA-256：\`${APK_SHA256}\`
+
+          > 从 \`v1.1.7\` 首次升级到 \`v1.1.8+\` 因启用了新签名证书，需先记录配置、卸载旧版后再安装，并去 \`my.zerotier.com\` 授权一次新 Node ID；后续同证书版本可直接覆盖升级。
+          EOF
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK_PATH" --clobber
+            gh release edit "$TAG" --notes-file "$NOTES_FILE"
+          else
+            gh release create "$TAG" "$APK_PATH" \
+              --target "$GITHUB_SHA" \
+              --title "ShizukuWOL ${TAG}" \
+              --notes-file "$NOTES_FILE"
+          fi
