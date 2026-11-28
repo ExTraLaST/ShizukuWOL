@@ -116,6 +116,7 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
 
     fun saveConfig(config: WolConfig) {
         store.save(config)
+        ZeroTierManager.updateRedactionSecrets(config)
         ZeroTierManager.setDiagLogEnabled(config.diagLogEnabled)
         applyZtEnabled(config)
     }
@@ -153,6 +154,7 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
     private fun now(): String = synchronized(timeFormat) { timeFormat.format(Date()) }
 
     private fun logWakeStart(cfg: WolConfig, action: String) {
+        ZeroTierManager.updateRedactionSecrets(cfg)
         ZeroTierManager.logSection("唤醒开始（$action）")
         val nwid = WolConfig.parseZtNetworkId(cfg.ztNetworkId)
         ZeroTierManager.logNote(
@@ -444,7 +446,7 @@ class WakeViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.value = _uiState.value.copy(
                 pcStatus = PingCheck.Status.UNKNOWN,
                 resultLines = listOf(
-                    ResultLine("状态检测", false, "电脑 IP 格式不正确，请填写 IPv4 地址（如 192.168.6.105）")
+                    ResultLine("状态检测", false, "电脑 IP 格式不正确，请填写 IPv4 地址（如 192.168.1.100）")
                 ),
                 lastActionTime = now()
             )

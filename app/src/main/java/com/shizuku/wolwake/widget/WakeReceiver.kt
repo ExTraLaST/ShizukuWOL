@@ -28,6 +28,7 @@ class WakeReceiver : BroadcastReceiver() {
                     ZeroTierManager.initDiagnostics(appContext)
                     ZeroTierManager.logSection("小部件唤醒")
                     val config = SettingsStore(appContext).load()
+                    ZeroTierManager.updateRedactionSecrets(config)
                     ZeroTierManager.logNote(
                         "小部件配置摘要：ztEnabled=${config.ztEnabled} " +
                             "networkIdValid=${WolConfig.parseZtNetworkId(config.ztNetworkId) != null} " +
