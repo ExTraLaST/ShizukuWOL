@@ -10,3 +10,8 @@ ShizukuWOL 项目私有仓库。
 ## 历史发布产物
 
 - **v1.1.7**：`ShizukuWOL-v1.1.7.apk`（请前往本仓库 Releases 页面下载）
+
+## 第三方许可声明
+
+- 内置 `app/libs/libzt-release.aar` 来自 [zerotier/libzt](https://github.com/zerotier/libzt)，原许可文本见 `app/libs/libzt-LICENSE.txt`（BSL 1.1，`Change Date: 2026-01-01`，到期自动转为 Apache License 2.0）。
+

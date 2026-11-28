@@ -13,9 +13,9 @@ class SettingsStore(context: Context) {
     fun load(): WolConfig = WolConfig(
         deviceName = prefs.getString(KEY_DEVICE_NAME, "家里电脑") ?: "家里电脑",
         macAddress = prefs.getString(KEY_MAC, "") ?: "",
-        broadcastAddress = prefs.getString(KEY_BROADCAST, "192.168.6.255") ?: "192.168.6.255",
+        broadcastAddress = prefs.getString(KEY_BROADCAST, "192.168.1.255") ?: "192.168.1.255",
         wolPort = prefs.getInt(KEY_PORT, 9),
-        pcIp = prefs.getString(KEY_PC_IP, "192.168.6.105") ?: "192.168.6.105",
+        pcIp = prefs.getString(KEY_PC_IP, "") ?: "",
         sshHost = prefs.getString(KEY_SSH_HOST, "") ?: "",
         sshPort = prefs.getInt(KEY_SSH_PORT, 22),
         sshUser = prefs.getString(KEY_SSH_USER, "root") ?: "root",

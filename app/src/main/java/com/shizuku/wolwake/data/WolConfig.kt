@@ -5,9 +5,9 @@ import java.math.BigInteger
 data class WolConfig(
     val deviceName: String = "家里电脑",
     val macAddress: String = "",
-    val broadcastAddress: String = "192.168.6.255",
+    val broadcastAddress: String = "192.168.1.255",
     val wolPort: Int = 9,
-    val pcIp: String = "192.168.6.105",
+    val pcIp: String = "",
     val sshHost: String = "",
     val sshPort: Int = 22,
     val sshUser: String = "root",

@@ -735,6 +735,7 @@ fun SettingsScreen(
             onValueChange = { pcIp = it },
             modifier = Modifier.fillMaxWidth(),
             label = { Text("电脑内网 IP（用于检测在线状态）") },
+            placeholder = { Text("如 192.168.1.100") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             singleLine = true
         )
@@ -747,7 +748,7 @@ fun SettingsScreen(
             onValueChange = { sshHost = it },
             modifier = Modifier.fillMaxWidth(),
             label = { Text("路由器 SSH 地址") },
-            placeholder = { Text("如 192.168.6.1") },
+            placeholder = { Text("如 192.168.1.1") },
             singleLine = true
         )
 
@@ -846,7 +847,7 @@ fun SettingsScreen(
             supportingText = {
                 Text(
                     "内置 ZeroTier 唤醒时连这个地址；在 my.zerotier.com 里查路由器那台设备的 IP。" +
-                        "libzt 不走 Central 的内网路由，所以这里不能填 192.168.6.1"
+                        "libzt 不走 Central 的内网路由，所以这里不能填 192.168.1.1 这类路由器内网 IP"
                 )
             },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -905,7 +906,7 @@ fun SettingsScreen(
             }
 
             Text(
-                text = "最新记录在最上面；点“复制日志”可复制全部日志。日志保存在本机，不包含 SSH 密码。",
+                text = "最新记录在最上面；点“复制日志”可复制全部日志。日志保存在本机，不含 SSH 密码与 MAC，复制时会自动脱敏 IP、主机地址与 ZeroTier ID。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -956,7 +957,7 @@ fun SettingsScreen(
                 }
                 OutlinedButton(
                     onClick = {
-                        clipboardManager.setText(AnnotatedString(ZeroTierManager.exportDiagLog()))
+                        clipboardManager.setText(AnnotatedString(ZeroTierManager.exportDiagLog(config)))
                         copiedHint = true
                     },
                     modifier = Modifier.weight(1f)
@@ -977,7 +978,7 @@ fun SettingsScreen(
 
             if (copiedHint) {
                 Text(
-                    text = "日志已复制，可直接粘贴发送。",
+                    text = "日志已脱敏复制，可直接粘贴发送。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -992,7 +993,7 @@ fun SettingsScreen(
                     WolConfig(
                         deviceName = deviceName.ifBlank { "家里电脑" },
                         macAddress = mac.trim(),
-                        broadcastAddress = broadcast.trim().ifBlank { "192.168.6.255" },
+                        broadcastAddress = broadcast.trim().ifBlank { "192.168.1.255" },
                         wolPort = port.toIntOrNull()?.takeIf { it in 1..65535 } ?: 9,
                         pcIp = pcIp.trim(),
                         sshHost = sshHost.trim(),
@@ -1022,7 +1023,7 @@ fun SettingsScreen(
         }
 
         Text(
-            text = "所有设置只保存在本机，不会上传到任何地方。\n内置 ZeroTier 由 libzt 提供（BSL 1.1 许可证）。",
+            text = "所有设置只保存在本机，不会上传到任何地方。\n内置 ZeroTier 由 libzt 提供（原 BSL 1.1，已于 2026-01-01 自动转为 Apache 2.0）。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )

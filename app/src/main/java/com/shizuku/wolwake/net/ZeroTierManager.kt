@@ -2,6 +2,7 @@ package com.shizuku.wolwake.net
 
 import android.content.Context
 import com.shizuku.wolwake.data.SettingsStore
+import com.shizuku.wolwake.data.WolConfig
 import com.zerotier.sockets.ZeroTierEventListener
 import com.zerotier.sockets.ZeroTierNative
 import com.zerotier.sockets.ZeroTierNode
@@ -41,8 +42,16 @@ object ZeroTierManager {
     private val _statusFlow = MutableStateFlow(ZtStatus())
     val statusFlow: StateFlow<ZtStatus> = _statusFlow.asStateFlow()
 
+    private val GENERIC_MAC_REGEX = Regex("\\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\\b")
+
     @Volatile
     private var diagLogEnabled: Boolean = false
+
+    @Volatile
+    private var redactedPassword: String = ""
+
+    @Volatile
+    private var redactedMac: String = ""
 
     @Volatile
     private var diagnosticFile: File? = null
@@ -88,11 +97,32 @@ object ZeroTierManager {
         diagLogEnabled = enabled
     }
 
+    fun updateRedactionSecrets(config: WolConfig) {
+        redactedPassword = config.sshPassword
+        redactedMac = config.macAddress.trim()
+    }
+
     private fun nowTimestamp(): String =
         SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
 
+    private fun redactCredentials(text: String, password: String, mac: String): String {
+        var s = text
+        if (password.isNotBlank()) {
+            s = s.replace(password, "***")
+        }
+        val cleanMac = mac.trim()
+        if (cleanMac.isNotEmpty()) {
+            s = s
+                .replace(cleanMac, "[MAC]", ignoreCase = true)
+                .replace(cleanMac.replace('-', ':'), "[MAC]", ignoreCase = true)
+                .replace(cleanMac.replace(':', '-'), "[MAC]", ignoreCase = true)
+                .replace(cleanMac.replace(":", "").replace("-", ""), "[MAC]", ignoreCase = true)
+        }
+        return s.replace(GENERIC_MAC_REGEX, "[MAC]")
+    }
+
     private fun sanitizeLogText(text: String): String {
-        val oneLine = text
+        val oneLine = redactCredentials(text, redactedPassword, redactedMac)
             .replace('\r', ' ')
             .replace('\n', ' ')
             .replace('\t', ' ')
@@ -139,9 +169,11 @@ object ZeroTierManager {
     }
 
     fun initDiagnostics(context: Context) {
-        diagLogEnabled = runCatching {
-            SettingsStore(context).load().diagLogEnabled
-        }.getOrDefault(false)
+        val cfg = runCatching { SettingsStore(context).load() }.getOrNull()
+        diagLogEnabled = cfg?.diagLogEnabled ?: false
+        if (cfg != null) {
+            updateRedactionSecrets(cfg)
+        }
 
         synchronized(logLock) {
             if (diagnosticsInitialized) return
@@ -223,16 +255,60 @@ object ZeroTierManager {
         }
     }
 
-    fun exportDiagLog(): String {
+    private fun redactForExport(text: String, config: WolConfig?): String {
+        val password = config?.sshPassword?.takeIf { it.isNotBlank() } ?: redactedPassword
+        val mac = config?.macAddress?.trim()?.takeIf { it.isNotEmpty() } ?: redactedMac
+        var result = redactCredentials(text, password, mac)
+
+        val replacements = mutableListOf<Pair<String, String>>()
+        if (config != null) {
+            replacements += config.ztNetworkId.trim() to "[ZT_NET_ID]"
+            replacements += config.ztSshHost.trim() to "[ZT_SSH_HOST]"
+            replacements += config.sshHost.trim() to "[SSH_HOST]"
+            replacements += config.pcIp.trim() to "[PC_IP]"
+            replacements += config.broadcastAddress.trim() to "[WOL_BROADCAST]"
+            val user = config.sshUser.trim()
+            if (user.isNotEmpty() && !user.equals("root", ignoreCase = true)) {
+                replacements += "user=$user" to "user=[SSH_USER]"
+                replacements += "sshUser=$user" to "sshUser=[SSH_USER]"
+            }
+        }
+        if (startedNetworkId != 0L) {
+            replacements += hex(startedNetworkId) to "[ZT_NET_ID]"
+        }
+        val current = currentStatus()
+        if (current.nodeIdHex().isNotEmpty()) {
+            replacements += current.nodeIdHex() to "[ZT_NODE_ID]"
+        }
+        if (!current.assignedIp.isNullOrBlank()) {
+            replacements += current.assignedIp.trim() to "[ZT_IP]"
+        }
+        seenPeersSnapshot().forEachIndexed { idx, peerId ->
+            if (peerId != 0L) {
+                replacements += hex(peerId) to "[ZT_PEER_${idx + 1}]"
+            }
+        }
+
+        replacements
+            .filter { (secret, _) -> secret.length >= 3 }
+            .distinctBy { (secret, _) -> secret.lowercase(Locale.ROOT) }
+            .sortedByDescending { (secret, _) -> secret.length }
+            .forEach { (secret, placeholder) ->
+                result = result.replace(secret, placeholder, ignoreCase = true)
+            }
+        return result
+    }
+
+    fun exportDiagLog(config: WolConfig? = null): String {
         val snapshot = synchronized(logLock) { logEntries.toList() }
         return buildString {
             appendLine("Shizuku WOL 诊断日志")
             appendLine("生成时间：${nowTimestamp()}")
             appendLine("条目数：${snapshot.size}")
-            appendLine("说明：日志不包含 SSH 密码。")
+            appendLine("说明：导出日志已自动脱敏 SSH 密码、MAC、IP、主机地址及 ZeroTier ID。")
             appendLine()
             snapshot.forEach { entry ->
-                appendLine("${entry.time} ${entry.text}")
+                appendLine("${entry.time} ${redactForExport(entry.text, config)}")
             }
         }
     }
